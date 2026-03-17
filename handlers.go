@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,7 +25,7 @@ func NewServer() (*Server, error) {
 		LogLevel: "error",
 	})
 
-	if err := client.Start(); err != nil {
+	if err := client.Start(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to start copilot client: %w", err)
 	}
 
@@ -43,7 +44,7 @@ func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models, err := s.client.ListModels()
+	models, err := s.client.ListModels(r.Context())
 	if err != nil {
 		log.Printf("Error listing models: %v", err)
 		writeError(w, http.StatusInternalServerError, "Failed to list models", "api_error")
@@ -106,13 +107,10 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[DEBUG] Received %d tools in request", len(req.Tools))
 	for _, tool := range req.Tools {
 		if tool.Type == "function" {
-			// toolJSON, _ := json.MarshalIndent(tool, "", "  ")
-			// log.Printf("[DEBUG] Tool %d: %s", i, string(toolJSON))
 			copilotTools = append(copilotTools, copilot.Tool{
 				Name:        tool.Function.Name,
 				Description: tool.Function.Description,
 				Parameters:  tool.Function.Parameters,
-				// No handler - we just want to capture tool calls
 			})
 		}
 	}
@@ -122,6 +120,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model:     req.Model,
 		Streaming: req.Stream,
 		Tools:     copilotTools,
+		OnPermissionRequest: copilot.PermissionHandler.ApproveAll,
 		// Disable infinite sessions for simple request/response
 		InfiniteSessions: &copilot.InfiniteSessionConfig{
 			Enabled: copilot.Bool(false),
@@ -138,8 +137,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If tools are provided, we want to limit available tools to only our custom ones
-	// This prevents Copilot from using built-in file/git tools
+	// If tools are provided, limit available tools to only our custom ones
 	if len(copilotTools) > 0 {
 		toolNames := make([]string, len(copilotTools))
 		for i, t := range copilotTools {
@@ -148,19 +146,8 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		sessionConfig.AvailableTools = toolNames
 	}
 
-	// Log session config
-	// log.Printf("[DEBUG] Creating session with model: %s, streaming: %v, tools: %d",
-	// 	req.Model, req.Stream, len(copilotTools))
-	for i, t := range copilotTools {
-		_ = i
-		_ = t
-		// paramsJSON, _ := json.Marshal(t.Parameters)
-		// log.Printf("[DEBUG] Copilot Tool %d: name=%s, desc=%s, params=%s",
-		// 	i, t.Name, t.Description, string(paramsJSON))
-	}
-
 	// Create session
-	session, err := s.client.CreateSession(sessionConfig)
+	session, err := s.client.CreateSession(r.Context(), sessionConfig)
 	if err != nil {
 		log.Printf("[ERROR] Creating session failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "Failed to create session", "api_error")
@@ -169,20 +156,17 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer session.Destroy()
 	log.Printf("[DEBUG] Session created successfully")
 
-	// Log the full prompt being sent
-	// log.Printf("[DEBUG] Full prompt being sent:\n%s", prompt)
-
 	if req.Stream {
 		log.Printf("[DEBUG] Starting streaming response")
-		s.handleStreamingResponse(w, session, prompt, req.Model)
+		s.handleStreamingResponse(w, r.Context(), session, prompt, req.Model)
 	} else {
 		log.Printf("[DEBUG] Starting non-streaming response")
-		s.handleNonStreamingResponse(w, session, prompt, req.Model)
+		s.handleNonStreamingResponse(w, r.Context(), session, prompt, req.Model)
 	}
 }
 
 // handleNonStreamingResponse handles non-streaming chat completions
-func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, session *copilot.Session, prompt, model string) {
+func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string) {
 	var contentBuilder strings.Builder
 	var toolCalls []ToolCall
 	var finishReason string = "stop"
@@ -225,7 +209,7 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, session *copi
 	})
 
 	// Send the message
-	_, err := session.Send(copilot.MessageOptions{
+	_, err := session.Send(ctx, copilot.MessageOptions{
 		Prompt: prompt,
 	})
 	if err != nil {
@@ -266,7 +250,7 @@ func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, session *copi
 }
 
 // handleStreamingResponse handles streaming chat completions with SSE
-func (s *Server) handleStreamingResponse(w http.ResponseWriter, session *copilot.Session, prompt, model string) {
+func (s *Server) handleStreamingResponse(w http.ResponseWriter, ctx context.Context, session *copilot.Session, prompt, model string) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -311,7 +295,6 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, session *copilot
 
 	var closeOnce sync.Once
 	session.On(func(event copilot.SessionEvent) {
-		// log.Printf("[DEBUG] Received event: %s", event.Type)
 		switch event.Type {
 		case copilot.AssistantMessageDelta:
 			// Stream content deltas
@@ -334,7 +317,6 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, session *copilot
 				mu.Lock()
 				for i, tr := range event.Data.ToolRequests {
 					argsJSON, _ := json.Marshal(tr.Arguments)
-					// log.Printf("[DEBUG]   Tool %d: %s with args: %s", i, tr.Name, string(argsJSON))
 					idx := i
 					// Store for final chunk
 					toolCalls = append(toolCalls, ToolCall{
@@ -364,7 +346,6 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, session *copilot
 					}}}, nil)
 				}
 				mu.Unlock()
-				// Return immediately - client needs to execute tools and send results back
 				closeOnce.Do(func() { close(done) })
 			}
 
@@ -377,14 +358,11 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, session *copilot
 				log.Printf("[DEBUG] SessionError: %s", *event.Data.Message)
 			}
 			closeOnce.Do(func() { close(done) })
-
-		default:
-			// log.Printf("[DEBUG] Unhandled event type: %s", event.Type)
 		}
 	})
 
 	// Send the message
-	_, err := session.Send(copilot.MessageOptions{
+	_, err := session.Send(ctx, copilot.MessageOptions{
 		Prompt: prompt,
 	})
 	if err != nil {
@@ -403,8 +381,6 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, session *copilot
 	// Send final chunk with finish_reason
 	mu.Lock()
 	if len(toolCalls) > 0 {
-		// log.Printf("[DEBUG] Tool calls already streamed, sending finish_reason only")
-		// Don't resend tool calls - they were already streamed incrementally
 		sendChunk(Message{}, strPtr("tool_calls"))
 	} else {
 		sendChunk(Message{}, strPtr("stop"))
@@ -412,7 +388,6 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, session *copilot
 	mu.Unlock()
 
 	// Send [DONE]
-	// log.Printf("[DEBUG] Sending [DONE] marker")
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
@@ -423,9 +398,7 @@ func buildPrompt(messages []Message) string {
 
 	for _, msg := range messages {
 		switch msg.Role {
-
 		case "system", "developer":
-			// System/developer messages are handled via SessionConfig.SystemMessage
 			continue
 		case "user":
 			parts = append(parts, fmt.Sprintf("[User]: %s", msg.Content))
@@ -433,7 +406,6 @@ func buildPrompt(messages []Message) string {
 			if msg.Content != "" {
 				parts = append(parts, fmt.Sprintf("[Assistant]: %s", msg.Content))
 			}
-			// Handle previous tool calls
 			for _, tc := range msg.ToolCalls {
 				parts = append(parts, fmt.Sprintf("[Assistant called tool %s with args: %s]", tc.Function.Name, tc.Function.Arguments))
 			}
